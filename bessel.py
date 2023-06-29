@@ -25,19 +25,21 @@ font = {'family' : 'Arial',
         }
 matplotlib.rc('font', **font)
 
-def axicon_mask(dimensions: np.ndarray, period: int) -> np.ndarray:
+def axicon_mask(dimensions: np.ndarray, period: int, alpha: float = 0) -> np.ndarray:
     mask = np.zeros(dimensions).astype(np.uint16)
-    _axicon_mask(mask, period)
+    _axicon_mask(mask, period, alpha)
     mask = ((mask / np.max(mask)) * 255).astype(np.uint16)
     return mask
 
 @jit
-def _axicon_mask(mask: np.ndarray, period: int):
+def _axicon_mask(mask: np.ndarray, period: int, alpha: float):
     holo_x: int = mask.shape[0] // 2
     holo_y: int = mask.shape[1] // 2
+    b2 = np.cos(alpha)**2
     for i, x in enumerate(np.linspace(-holo_x, holo_x, mask.shape[0]).astype(np.float32)):
         for j, y in enumerate(np.linspace(-holo_y, holo_y, mask.shape[1]).astype(np.float32)):
-            mask[i, j] = period - int(np.sqrt(x**2 + y**2)) % period
+            mask[i, j] = period - int(np.sqrt(b2 * x**2 + y**2)) % period
+            # mask[i, j] = np.exp(np.sqrt(b2 * x**2 + y**2))
 
 
 @jit
@@ -108,7 +110,7 @@ class BesselSource():
 
 class PhaseMask(BesselSource):
     
-    def __init__(self, dimensions, pixel_size, phase_stroke, pixel_period):
+    def __init__(self, dimensions, pixel_size, phase_stroke, pixel_period, alpha=0):
         if pixel_period < 2:
             raise ValueError('Phase mask for period < 1 cannot be created')
         if type(pixel_period) is not int:
@@ -117,7 +119,8 @@ class PhaseMask(BesselSource):
         self.pixel_size = pixel_size
         self.phase_stroke = phase_stroke
         self.pixel_period = pixel_period
-        self._mask = axicon_mask(dimensions, pixel_period)
+        self.alpha = alpha
+        self._mask = axicon_mask(dimensions, pixel_period, alpha=self.alpha)
         
     @property
     def mask(self):
@@ -146,7 +149,7 @@ class PhaseMask(BesselSource):
     #     j0_term = J0((k*(n - 1)*h*r) / d)  # Pass in result of Bessel function. TODO implement bessel fn
     #     return _bessel_field(k, A, n, h, d, w, N, z, r, lam, j0_term)    
     
-    def add_uniform_random_sample(self, mask):
+    def add_using_uniform_random_sample(self, mask):
         if not isinstance(mask, PhaseMask) or not self._mask.shape == mask._mask.shape:
             raise ValueError("'mask' must be a PhaseMask instance with the same shape.")
         mask1 = self._mask.copy()
@@ -155,7 +158,7 @@ class PhaseMask(BesselSource):
             mask1.flat[i] = mask2.flat[i]
         return mask1  # TODO make return a PhaseMask instance
     
-    def add_radial_sections(self, mask, sections=128):
+    def add_using_radial_sections(self, mask, sections=128):
         if not isinstance(mask, PhaseMask) or not self._mask.shape == mask._mask.shape:
             raise ValueError("'mask' must be a PhaseMask instance with the same shape.")
         mask1 = self._mask.copy()
@@ -196,7 +199,7 @@ class PhaseMask(BesselSource):
     
     def imshow(self):
         fig = plt.figure('PhaseMask imshow')
-        ax = fig.subplot(1, 1, 1)
+        ax = plt.subplot(1, 1, 1)
         fig.set_facecolor('black')
         ax.imshow(np.rot90(self._mask), cmap='Greys_r')
     
@@ -233,6 +236,7 @@ class Axicon(BesselSource):
         return PhaseMask(dimensions, pixel_size, phase_stroke, px_per_ring)
     
 
+@staticmethod
 def visualize(field: BesselField, source: BesselSource, ray_alpha=0.15, number_of_rays=14, aspect=5):
     fig, ax = plt.subplot_mosaic(
         [['upper left', 'upper middle', 'upper right'], ['bottom', 'bottom', 'bottom']],
@@ -320,7 +324,7 @@ def visualize(field: BesselField, source: BesselSource, ray_alpha=0.15, number_o
 
 if __name__ == "__main__":
     
-    AXICON_ANGLE = 1.0 * PI / 180  # rad
+    AXICON_ANGLE = 0.25 * PI / 180  # rad
     AXICON_RADIUS = 12.7 / 2  # mm
     AXICON_INDEX = 1.51637
     WAVELENGTH = 1040 * 10**-6  # mm
@@ -329,13 +333,14 @@ if __name__ == "__main__":
     SLM_PHASE_STROKE = 1.4  # TODO upload Meadowlark LUT
     SLM_PIXEL_SIZE = 9.2 * 10**-3  # mm
     
-    for angle_rad in np.linspace(0.0001, 0.0064, 128):
-            ax = Axicon(angle_rad, AXICON_RADIUS, AXICON_INDEX)
-            mask = ax.get_equivalent_mask(SLM_DIM, WAVELENGTH, SLM_PIXEL_SIZE, SLM_PHASE_STROKE)
-            print('Creating mask with period', mask.pixel_period, 'corresponding to angle', angle_rad  * 1000, 'mrad')
-            mask = PhaseMask(SLM_DIM, SLM_PIXEL_SIZE, SLM_PHASE_STROKE, int(mask.pixel_period))
-            mask.export('R:\\shohas01lab\\shohas01labspace\\Stephen\\bessel_phase_masks_from_raytrace\\' + '1920_1152_N' + str(mask.pixel_period).zfill(3))
-    
+    for angle_rad in np.linspace(0.003, 0.006, 24):
+        for angle_of_incidence in np.linspace(0, 24, 24):
+                ax = Axicon(angle_rad, AXICON_RADIUS, AXICON_INDEX)
+                mask = ax.get_equivalent_mask(SLM_DIM, WAVELENGTH, SLM_PIXEL_SIZE, SLM_PHASE_STROKE)
+                print('Creating mask with period', mask.pixel_period, 'corresponding to angle', str(angle_rad  * 1000)[0:4], 'mrad (' + str(angle_rad * 180 / PI)[0:4] + ' deg)')
+                mask = PhaseMask(SLM_DIM, SLM_PIXEL_SIZE, SLM_PHASE_STROKE, int(mask.pixel_period), alpha=angle_of_incidence * PI / 180)
+                mask.export('R:\\shohas01lab\\shohas01labspace\\Stephen\\bessel_masks_elliptic\\' + '1920_1152_N' + str(mask.pixel_period).zfill(3) + '_A' + str(angle_of_incidence)[0:4])
+        
     # mask1 = PhaseMask(SLM_DIM, SLM_PIXEL_SIZE, SLM_PHASE_STROKE, 60)
     # for n in np.arange(1, 24):
     #     for m in np.arange(1, 24):
@@ -363,6 +368,3 @@ if __name__ == "__main__":
     #     print('Creating mask with period', n + 1)
     #     mask = PhaseMask(SLM_DIM, SLM_PIXEL_SIZE, SLM_PHASE_STROKE, int(n + 1))
     #     mask.export('R:\\shohas01lab\\shohas01labspace\\Stephen\\bessel_phase_masks\\' + '1920_1152_N' + str(n + 1).zfill(3))
-
-
-
