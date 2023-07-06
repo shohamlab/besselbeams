@@ -129,12 +129,14 @@ def generate_mask(parameters: dict) -> np.ndarray:
         parameters['mask-ellipticity'][0] * np.pi / 180,
         parameters['mask-ellipticity'][1] * np.pi / 180
     )
-    ax1 = axicon_mask(
-        parameters['slm-dimensions'],
-        parameters['period-1'],
-        ellip_radians,
-        parameters['mask-offset']
-    )
+    ax1 = np.zeros(parameters['slm-dimensions'], dtype=np.uint16)
+    if parameters['axicon-1-enabled']:
+        ax1 = axicon_mask(
+            parameters['slm-dimensions'],
+            parameters['period-1'],
+            ellip_radians,
+            parameters['mask-offset']
+        )
     if parameters['axicon-2-enabled']:
         ax2 = axicon_mask(
             parameters['slm-dimensions'],
@@ -143,19 +145,21 @@ def generate_mask(parameters: dict) -> np.ndarray:
             parameters['mask-offset']
         )
         ax1 = add_radial_sections(ax1, ax2, offset=parameters['mask-offset'], sections=64)
-#    if parameters['lens-enabled']:
-#        lens = lens_mask(
-#            parameters['slm-dimensions'],
-#            parameters['focal_length'],
-#            ellip_radians,
-#            parameters['mask-offset']  
-#        )
+    if parameters['lens-enabled']:
+        lens = lens_mask(
+            parameters['slm-dimensions'],
+            parameters['lens-f'],
+            ellip_radians,
+            parameters['mask-offset']  
+        )
+        ax1 = (ax1 + lens) % 255
     return ax1.astype(np.uint8)
 
 
 def lens_mask(dimensions: np.ndarray, focal_length: float, alpha: tuple, offset: tuple) -> np.ndarray:
     mask = np.zeros(dimensions).astype(np.uint16)
-    _lens_mask(mask, focal_length, *alpha, *offset)
+    if focal_length != 0:
+        _lens_mask(mask, focal_length, *alpha, *offset)
     return mask
 
 
@@ -231,8 +235,10 @@ class BesselGui(tk.Tk):
         self._frame_right.pack(side=tk.RIGHT)
         
         # TODO load from JSON to save state
+        # TODO make params data structure an object
         self._frame_params.insert_params({
             'slm-dimensions': (1920, 1152),
+            'axicon-1-enabled': True,
             'period-1': 30,
             'axicon-2-enabled': False,
             'period-2': 32,
@@ -292,6 +298,7 @@ class BesselGui(tk.Tk):
                 if self.slm_api.Write_image(mask.flatten(order='F')) == 0:
                     print('Phase mask uploaded with Error Code 0')
         except Exception as e:  # TODO something less stupid
+            print(e)
             pass # Callback not set up yet
     
     def poll_slm(self):
@@ -352,11 +359,16 @@ class AxiconParamFrame(tk.Frame):
         self._period1 = tk.IntVar(self, value=30)
         self._period1.trace_add('write', callback=self.update)
 
+        self._axicon_1_is_enabled = tk.IntVar(self, value=False)
+        self._axicon_1_is_enabled.trace_add('write', callback=self.update)
+
         self._frame_period1 = tk.Frame(self)
+        self._checkbox_period1 = tk.Checkbutton(self._frame_period1, text='Enable Axicon 1', var=self._axicon_1_is_enabled, command=self.toggle_axicon_1)
+        self._checkbox_period1.grid(row=0, columnspan=2)
         self._label_period1 = tk.Label(self._frame_period1, text='Axicon 1 period (px)')
-        self._label_period1.grid(row=0, column=0)
+        self._label_period1.grid(row=1, column=0)
         self._spinbox_period1 = tk.Spinbox(self._frame_period1, relief=tk.FLAT, width=10, from_=1, to_=2048, increment=2, textvariable=self._period1)
-        self._spinbox_period1.grid(row=0, column=1)
+        self._spinbox_period1.grid(row=1, column=1)
         self._frame_period1.grid(row=1, column=0)
 
         self._period2 = tk.IntVar(self, value=32)
@@ -438,6 +450,12 @@ class AxiconParamFrame(tk.Frame):
          )
         self._label_lens_f.config(state=('disabled', 'normal')[self._lens_is_enabled.get()])
     
+    def toggle_axicon_1(self):
+        self._spinbox_period1.config(
+                state=('disabled', 'normal')[self._axicon_1_is_enabled.get()],
+                relief=(tk.GROOVE, tk.FLAT)[self._axicon_1_is_enabled.get()]
+         )
+        self._label_period1.config(state=('disabled', 'normal')[self._axicon_1_is_enabled.get()])
     
     def toggle_axicon_2(self):
         self._spinbox_period2.config(
@@ -452,18 +470,20 @@ class AxiconParamFrame(tk.Frame):
     def get_parameters(self) -> dict:
         return {
             'slm-dimensions': (int(self._dim_x.get()), int(self._dim_y.get())),
+            'axicon-1-enabled': bool(self._axicon_1_is_enabled.get()),
             'period-1': int(self._period1.get()),
             'axicon-2-enabled': bool(self._axicon_2_is_enabled.get()),
             'period-2': int(self._period2.get()),
             'mask-offset': (int(self._offset_x.get()), int(self._offset_y.get())),
             'mask-ellipticity': (float(self._ellip_x.get()), float(self._ellip_y.get())),
-            'lens-f': float(self._lens_f.get()),
+            'lens-f': float(self._lens_focal_length.get()),
             'lens-enabled': bool(self._lens_is_enabled.get())
         }
     
     def insert_params(self, params: dict):
         self._dim_x.set(params['slm-dimensions'][0])
         self._dim_y.set(params['slm-dimensions'][1])
+        self._axicon_1_is_enabled.set(params['axicon-1-enabled'])
         self._period1.set(params['period-1'])
         self._axicon_2_is_enabled.set(params['axicon-2-enabled'])
         self._period2.set(params['period-2'])
