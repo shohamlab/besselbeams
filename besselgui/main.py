@@ -397,7 +397,7 @@ class AxiconParamFrame(tk.Frame):
         self._checkbox_lens.grid(row=0, columnspan=2)
         self._label_lens_f = tk.Label(self._frame_lens, text='Lens focal length (px)')
         self._label_lens_f.grid(row=1, column=0)
-        self._spinbox_lens_f = tk.Spinbox(self._frame_lens, relief=tk.FLAT, width=10, from_=-9999, to_=9999, increment=100, textvariable=self._lens_focal_length)
+        self._spinbox_lens_f = tk.Spinbox(self._frame_lens, relief=tk.FLAT, width=10, from_=-9999, to_=9999, increment=10, textvariable=self._lens_focal_length)
         self._spinbox_lens_f.grid(row=1, column=1)
         self._frame_lens.grid(row=3, column=0)
         
