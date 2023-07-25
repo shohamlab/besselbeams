@@ -53,7 +53,25 @@ def generate_mask(parameters: dict) -> np.ndarray:
             parameters['mask-offset']  
         )
         ax1 = (ax1 + lens) % 255
+    if parameters['ramp-enabled']:
+        ramp = ramp_mask(
+            parameters['slm-dimensions'],
+            *parameters['ramp-slope']
+        )
+        ax1 = (ax1 + ramp) % 255
     return ax1.astype(np.uint8)
+
+
+def ramp_mask(dimensions: np.ndarray, slope_x: float, slope_y: float):
+    mask = np.zeros(dimensions)
+    return _ramp_mask(mask.astype(float), dimensions, slope_x, slope_y)
+
+@jit
+def _ramp_mask(mask: np.ndarray, dimensions: np.ndarray, slope_x: float, slope_y: float):
+    for i, x in enumerate(np.arange(dimensions[0])):
+        for j, y in enumerate(np.arange(dimensions[1])):
+            mask[i, j] = x * slope_x + y * slope_y
+    return (mask % 255).astype(np.uint8)
 
 
 def lens_mask(dimensions: np.ndarray, focal_length: float, alpha: tuple, offset: tuple) -> np.ndarray:
@@ -144,6 +162,9 @@ class BesselGui(tk.Tk):
             'period-2': 32,
             'mask-offset': (0, 0),
             'mask-ellipticity': (0.0, 0.0),
+            'mask-contour': (0.0, 0.0),
+            'ramp-enabled': False,
+            'ramp-slope': (0, 0),
             'lens-enabled': False,
             'lens-f': 9999.,
         })
@@ -293,7 +314,7 @@ class AxiconParamFrame(tk.Frame):
         self._lens_is_enabled.trace_add('write', callback=self.update)
 
         self._frame_lens = tk.Frame(self)
-        self._checkbox_lens = tk.Checkbutton(self._frame_lens, text='Lens', var=self._lens_is_enabled, command=self.toggle_lens)
+        self._checkbox_lens = tk.Checkbutton(self._frame_lens, text='Enable Lens', var=self._lens_is_enabled, command=self.toggle_lens)
         self._checkbox_lens.grid(row=0, columnspan=2)
         self._label_lens_f = tk.Label(self._frame_lens, text='Lens focal length (px)')
         self._label_lens_f.grid(row=1, column=0)
@@ -301,6 +322,28 @@ class AxiconParamFrame(tk.Frame):
         self._spinbox_lens_f.grid(row=1, column=1)
         self._frame_lens.grid(row=3, column=0)
         
+        self._ramp_slope_x = tk.DoubleVar(self, value=0)
+        self._ramp_slope_x.trace_add('write', callback=self.update)
+
+        self._ramp_slope_y = tk.DoubleVar(self, value=0)
+        self._ramp_slope_y.trace_add('write', callback=self.update)
+
+        self._ramp_is_enabled = tk.IntVar(self, value=False)        
+        self._ramp_is_enabled.trace_add('write', callback=self.update)
+
+        self._frame_ramp = tk.Frame(self)
+        self._checkbox_ramp = tk.Checkbutton(self._frame_ramp, text='Enable Ramp', var=self._ramp_is_enabled, command=self.toggle_ramp)
+        self._checkbox_ramp.grid(row=0, column=0, columnspan=4)
+        self._spinbox_ramp_x = tk.Spinbox(self._frame_ramp, relief=tk.FLAT, width=10, from_=-1, to_=1, increment=0.01, textvariable=self._ramp_slope_x)
+        self._label_ramp1 = tk.Label(self._frame_ramp, text='Slope (px)')
+        self._label_ramp1.grid(row=1, column=0)
+        self._spinbox_ramp_x.grid(row=1, column=1)
+        self._label_ramp2 = tk.Label(self._frame_ramp, text=', ')
+        self._label_ramp2.grid(row=1, column=2)
+        self._spinbox_ramp_y = tk.Spinbox(self._frame_ramp, relief=tk.FLAT, width=10, from_=-1, to_=1, increment=0.01, textvariable=self._ramp_slope_y)
+        self._spinbox_ramp_y.grid(row=1, column=3)
+        self._frame_ramp.grid(row=4, column=0)
+
         self._offset_x = tk.IntVar(self, value=0)
         self._offset_y = tk.IntVar(self, value=0)
         self._offset_x.trace_add('write', callback=self.update)
@@ -315,7 +358,7 @@ class AxiconParamFrame(tk.Frame):
         self._label_offset2.grid(row=0, column=2)
         self._spinbox_offset_y = tk.Spinbox(self._frame_offset, relief=tk.FLAT, width=10, from_=-1024, to_=1024, increment=10, textvariable=self._offset_y)
         self._spinbox_offset_y.grid(row=0, column=3)
-        self._frame_offset.grid(row=4, column=0)
+        self._frame_offset.grid(row=5, column=0)
 
         self._ellip_x = tk.DoubleVar(self, value=0)
         self._ellip_y = tk.DoubleVar(self, value=0)
@@ -331,7 +374,25 @@ class AxiconParamFrame(tk.Frame):
         self._label_ellip2.grid(row=0, column=2)
         self._spinbox_ellip_y = tk.Spinbox(self._frame_ellip, relief=tk.FLAT, width=10, from_=0, to_=120, increment=2, textvariable=self._ellip_y)
         self._spinbox_ellip_y.grid(row=0, column=3)
-        self._frame_ellip.grid(row=5, column=0)
+        self._frame_ellip.grid(row=6, column=0)
+    
+        self._contour_x = tk.DoubleVar(self, value=0)
+        self._contour_y = tk.DoubleVar(self, value=0)
+        self._contour_x.trace_add('write', callback=self.update)
+        self._contour_y.trace_add('write', callback=self.update)
+
+        self._frame_contour = tk.Frame(self)
+        self._label_contour = tk.Label(self._frame_contour, text='Contour (𝜀)')
+        self._label_contour.grid(row=0, column=0)
+        self._spinbox_contour_x = tk.Spinbox(self._frame_contour, relief=tk.FLAT, width=10, from_=-2, to_=2, increment=0.1, textvariable=self._contour_x)
+        self._spinbox_contour_x.grid(row=0, column=1)
+        self._label_contour2 = tk.Label(self._frame_contour, text=', ')
+        self._label_contour2.grid(row=0, column=2)
+        self._spinbox_contour_y = tk.Spinbox(self._frame_contour, relief=tk.FLAT, width=10, from_=-2, to_=2, increment=0.1, textvariable=self._contour_y)
+        self._spinbox_contour_y.grid(row=0, column=3)
+        self._frame_contour.grid(row=7, column=0)
+
+
     
     def unfix_dims(self):
         self._spinbox_dim_x.config(state='normal', relief=tk.FLAT)
@@ -343,6 +404,18 @@ class AxiconParamFrame(tk.Frame):
         self._spinbox_dim_x.config(state='disabled', relief=tk.GROOVE)
         self._spinbox_dim_y.config(state='disabled', relief=tk.GROOVE)
 
+    def toggle_ramp(self):
+        self._spinbox_ramp_x.config(
+                state=('disabled', 'normal')[self._ramp_is_enabled.get()],
+                relief=(tk.GROOVE, tk.FLAT)[self._ramp_is_enabled.get()]
+        )
+        self._spinbox_ramp_y.config(
+                state=('disabled', 'normal')[self._ramp_is_enabled.get()],
+                relief=(tk.GROOVE, tk.FLAT)[self._ramp_is_enabled.get()]
+        )
+        self._label_ramp1.config(state=('disabled', 'normal')[self._ramp_is_enabled.get()])
+        self._label_ramp2.config(state=('disabled', 'normal')[self._ramp_is_enabled.get()])
+
     def toggle_lens(self):
         self._spinbox_lens_f.config(
                 state=('disabled', 'normal')[self._lens_is_enabled.get()],
@@ -351,6 +424,9 @@ class AxiconParamFrame(tk.Frame):
         self._label_lens_f.config(state=('disabled', 'normal')[self._lens_is_enabled.get()])
     
     def toggle_axicon_1(self):
+        if not self._axicon_1_is_enabled.get() and self._axicon_2_is_enabled.get():
+            self._axicon_2_is_enabled.set(False)
+            self.toggle_axicon_2()
         self._spinbox_period1.config(
                 state=('disabled', 'normal')[self._axicon_1_is_enabled.get()],
                 relief=(tk.GROOVE, tk.FLAT)[self._axicon_1_is_enabled.get()]
@@ -376,6 +452,9 @@ class AxiconParamFrame(tk.Frame):
             'period-2': int(self._period2.get()),
             'mask-offset': (int(self._offset_x.get()), int(self._offset_y.get())),
             'mask-ellipticity': (float(self._ellip_x.get()), float(self._ellip_y.get())),
+            'mask-contour': (float(self._contour_x.get()), float(self._contour_y.get())),
+            'ramp-enabled': bool(self._ramp_is_enabled.get()),
+            'ramp-slope': (float(self._ramp_slope_x.get()), float(self._ramp_slope_y.get())),
             'lens-f': float(self._lens_focal_length.get()),
             'lens-enabled': bool(self._lens_is_enabled.get())
         }
@@ -391,11 +470,17 @@ class AxiconParamFrame(tk.Frame):
         self._offset_y.set(params['mask-offset'][1])
         self._ellip_x.set(float(params['mask-ellipticity'][0]))
         self._ellip_y.set(float(params['mask-ellipticity'][1]))
+        self._contour_x.set(float(params['mask-contour'][0]))
+        self._contour_y.set(float(params['mask-contour'][1]))
         self._lens_focal_length.set(float(params['lens-f']))
         self._lens_is_enabled.set(params['lens-enabled'])
+        self._ramp_is_enabled.set(params['ramp-enabled'])
+        self._ramp_slope_x.set(params['ramp-slope'][0])
+        self._ramp_slope_y.set(params['ramp-slope'][1])
         # Call update functions
         self.toggle_axicon_2()
         self.toggle_lens()
+        self.toggle_ramp()
 
 
 class BmpDisplay(tk.Frame):
