@@ -4,108 +4,24 @@ import numpy as np
 import random
 from numba import jit
 import time
-import ctypes
 import os
+import sys
+from Meadowlark_Blink_C import Blink
 
-
-class Meadowlark_Blink_C_wrapper():
-    
-    def __init__(self, path_to_api: str):
-        self.connected = False
-        self.api_loaded = False
-        try:
-            self._lib = ctypes.cdll.LoadLibrary(path_to_api)
-        except OSError:
-            return
-        self._lib.Create_SDK.argtypes = [
-            ctypes.c_uint32,
-            ctypes.POINTER(ctypes.c_uint32),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_char_p        
-        ]
-        self._lib.Load_LUT_file.argtypes = [
-            ctypes.c_int,  # Hardware ID (should be 1)
-            ctypes.c_char_p  # Path to .lut file
-        ]
-        self._lib.Write_image.argtypes = [
-                ctypes.c_int,  # Board ID
-                np.ctypeslib.ndpointer(ctypes.c_uint8, flags="C_CONTIGUOUS"), # Image buffer
-                ctypes.c_uint32,  # Image size (width * height)
-                ctypes.c_int,  # Wait for trigger
-                ctypes.c_int,  # External pulse
-                ctypes.c_uint32  # Trigger timeout (ms)
-        ]
-        self._lib.Read_SLM_temperature.argtypes = [ctypes.c_int]
-        self._lib.Read_SLM_temperature.restype = ctypes.c_double
-        self._lib.Get_image_width.argtypes = [ctypes.c_int]
-        self._lib.Get_image_height.argtypes = [ctypes.c_int]
-        self.api_loaded = True
-        
-    def Create_SDK(self, slm_bitness=12):
-        if self.api_loaded:
-            n_boards_found = ctypes.c_uint32()
-            status = ctypes.c_int()
-            try:
-                self._lib.Create_SDK(
-                    ctypes.c_uint32(slm_bitness),
-                    ctypes.byref(n_boards_found),
-                    ctypes.byref(status),
-                    1,
-                    1,
-                    0,
-                    10,  # From manual's recommendation
-                    ctypes.c_char_p()  # Null calibration
-                );
-            except OSError:
-                return -1, -1
-            return n_boards_found.value, status.value
-        raise Exception('Library not successfully loaded')
-    
-    def Load_LUT_file(self, lut_file: str):
-        if self.api_loaded:
-            try:
-                return self._lib.Load_LUT_file(
-                    1,
-                    lut_file.encode('utf-8')
-                );
-            except OSError:
-                return -1
-        raise Exception('Library not successfully loaded')
-        
-    def Write_image(self, phase_mask):
-        if self.api_loaded:
-            try:
-                return self._lib.Write_image(
-                    1,
-                    phase_mask.astype(np.uint8),
-                    phase_mask.size,
-                    0,
-                    0,
-                    5000  # 5 second timeout. Might block this long
-                );
-            except OSError:
-                return -1
-        raise Exception('Library not successfully loaded')
-        
-    def Read_SLM_temperature(self) -> float:
-        if self.api_loaded:
-            try:
-                return self._lib.Read_SLM_temperature(1)
-            except OSError:
-                return -1
-        raise Exception('Library not successfully loaded')
-        
-    def Read_SLM_dimensions(self) -> (int, int):
-        if self.api_loaded:
-            try:
-                return (self._lib.Get_image_width(1), self._lib.Get_image_height(1))
-            except OSError:
-                return (-1, -1)
-        raise Exception('Library not successfully loaded')
+@jit
+def add_radial_sections(mask1, mask2, offset=(0, 0), sections=128):
+    θs = np.linspace(0, 2 * np.pi, sections + 1)[:-1]
+    dθ = θs[1] - θs[0]
+    theta_bounds = []
+    for θ in θs[::2]:
+        theta_bounds.append((θ, θ + dθ))
+    for i, x in enumerate(np.arange(mask1.shape[0]) - mask1.shape[0] // 2):
+        for j, y in enumerate(np.arange(mask2.shape[1]) - mask2.shape[1] // 2):
+            θ = np.arctan2(-x - offset[0], -y - offset[1]) + np.pi
+            for bounds in theta_bounds:
+                if θ >= bounds[0] and θ < bounds[1]:
+                    mask1[i, j] = mask2[i, j]
+    return mask1
 
 
 def generate_mask(parameters: dict) -> np.ndarray:
@@ -113,19 +29,75 @@ def generate_mask(parameters: dict) -> np.ndarray:
         parameters['mask-ellipticity'][0] * np.pi / 180,
         parameters['mask-ellipticity'][1] * np.pi / 180
     )
-    ax1 = axicon_mask(
+    ax1 = np.zeros(parameters['slm-dimensions'], dtype=np.uint16)
+    if parameters['axicon-1-enabled']:
+        ax1 = axicon_mask(
             parameters['slm-dimensions'],
             parameters['period-1'],
             ellip_radians,
             parameters['mask-offset']
-    )
+        )
+    if parameters['axicon-2-enabled']:
+        ax2 = axicon_mask(
+            parameters['slm-dimensions'],
+            parameters['period-2'],
+            ellip_radians,
+            parameters['mask-offset']
+        )
+        ax1 = add_radial_sections(ax1, ax2, offset=parameters['mask-offset'], sections=64)
+    if parameters['lens-enabled']:
+        lens = lens_mask(
+            parameters['slm-dimensions'],
+            parameters['lens-f'],
+            ellip_radians,
+            parameters['mask-offset']  
+        )
+        ax1 = (ax1 + lens) % 255
+    if parameters['ramp-enabled']:
+        ramp = ramp_mask(
+            parameters['slm-dimensions'],
+            *parameters['ramp-slope']
+        )
+        ax1 = (ax1 + ramp) % 255
     return ax1.astype(np.uint8)
-    
+
+
+def ramp_mask(dimensions: np.ndarray, slope_x: float, slope_y: float):
+    mask = np.zeros(dimensions)
+    return _ramp_mask(mask.astype(float), dimensions, slope_x, slope_y)
+
+@jit
+def _ramp_mask(mask: np.ndarray, dimensions: np.ndarray, slope_x: float, slope_y: float):
+    for i, x in enumerate(np.arange(dimensions[0])):
+        for j, y in enumerate(np.arange(dimensions[1])):
+            mask[i, j] = x * slope_x + y * slope_y
+    return (mask % 255).astype(np.uint8)
+
+
+def lens_mask(dimensions: np.ndarray, focal_length: float, alpha: tuple, offset: tuple) -> np.ndarray:
+    mask = np.zeros(dimensions).astype(np.uint16)
+    if focal_length != 0:
+        _lens_mask(mask, focal_length, *alpha, *offset)
+    return mask
+
+
+@jit
+def _lens_mask(mask: np.ndarray, focal_length: float, alpha_x: float, alpha_y: float, offset_x: int, offset_y: int):
+    holo_x: int = mask.shape[0] // 2
+    holo_y: int = mask.shape[1] // 2
+    b2_x: float = np.cos(alpha_x)**2
+    b2_y: float = np.cos(alpha_y)**2
+    for i, x in enumerate(np.linspace(-holo_x, holo_x, mask.shape[0]).astype(np.float32)):
+        for j, y in enumerate(np.linspace(-holo_y, holo_y, mask.shape[1]).astype(np.float32)):
+            mask[i, j] = int((b2_x * (x + offset_x)**2 + b2_y * (y + offset_y)**2) / (2 * focal_length)) % 255
+
+
 def axicon_mask(dimensions: np.ndarray, period: int, alpha: tuple, offset: tuple, greylevel: int = 255) -> np.ndarray:
     mask = np.zeros(dimensions).astype(np.uint16)
     _axicon_mask(mask, period, *alpha, *offset)
     mask = ((mask / np.max(mask)) * min(greylevel, 255)).astype(np.uint16)
     return mask
+
 
 @jit
 def _axicon_mask(mask: np.ndarray, period: int, alpha_x: float, alpha_y: float, offset_x: int, offset_y: int):
@@ -181,13 +153,20 @@ class BesselGui(tk.Tk):
         self._frame_right.pack(side=tk.RIGHT)
         
         # TODO load from JSON to save state
+        # TODO make params data structure an object
         self._frame_params.insert_params({
             'slm-dimensions': (1920, 1152),
+            'axicon-1-enabled': True,
             'period-1': 30,
             'axicon-2-enabled': False,
             'period-2': 32,
             'mask-offset': (0, 0),
             'mask-ellipticity': (0.0, 0.0),
+            'mask-contour': (0.0, 0.0),
+            'ramp-enabled': False,
+            'ramp-slope': (0, 0),
+            'lens-enabled': False,
+            'lens-f': 9999.,
         })
         self.update()
     
@@ -201,7 +180,7 @@ class BesselGui(tk.Tk):
         os.environ['path'] += ';' + api_dir
         self.path_to_meadowlark_lib = os.path.join(api_dir, 'Blink_C_wrapper.dll')
         self._statusbar.set('Loading {}...'.format(self.path_to_meadowlark_lib))
-        self.slm_api = Meadowlark_Blink_C_wrapper(self.path_to_meadowlark_lib)
+        self.slm_api = Blink(self.path_to_meadowlark_lib)
         if self.slm_api.api_loaded:
             self._statusbar.set('SLM Connected!')
         else:
@@ -209,8 +188,8 @@ class BesselGui(tk.Tk):
             self.slm_api = None
             return
         n_boards_found, status = self.slm_api.Create_SDK()
-        if n_boards_found == -1:
-            self._statusbar.set('Failed to connect to SLM. Try reinstalling the SLM via Windows Device Manager.')
+        if n_boards_found <= 0:
+            self._statusbar.set('Failed to connect to SLM. Try reinstalling the SLM via Windows Device Manager')
             return
         self._statusbar.set('{} board(s) found (will only use first device), Status Code {}'.format(n_boards_found, status))
         self.path_to_calib_file = tk.filedialog.askopenfilename(
@@ -232,6 +211,7 @@ class BesselGui(tk.Tk):
     def update(self):
         try:
             start = time.time()
+            self._statusbar.set('Generating mask...')
             mask = generate_mask(self._frame_params.get_parameters())
             self._statusbar.set('Generated phase mask in {} s.'.format(str(time.time() - start)[0:5]))
             self._bmp_display.set_image(mask)
@@ -239,6 +219,7 @@ class BesselGui(tk.Tk):
                 if self.slm_api.Write_image(mask.flatten(order='F')) == 0:
                     print('Phase mask uploaded with Error Code 0')
         except Exception as e:  # TODO something less stupid
+            print(e)
             pass # Callback not set up yet
     
     def poll_slm(self):
@@ -252,6 +233,7 @@ class BesselGui(tk.Tk):
         else:
             self._label_temp.config(text='SLM Disconnected', fg='red')
             self._frame_params.unfix_dims()
+            self._statusbar.set('Lost connection to SLM')
 
 
 class StatusBar(tk.Frame):
@@ -285,7 +267,7 @@ class AxiconParamFrame(tk.Frame):
         self._dim_y.trace_add('write', callback=self.update)
 
         self._frame_dim = tk.Frame(self)
-        self._label_dim = tk.Label(self._frame_dim, text='SLM dimensions')
+        self._label_dim = tk.Label(self._frame_dim, text='SLM dimensions (px)')
         self._label_dim.grid(row=0, column=0)
         self._spinbox_dim_x = tk.Spinbox(self._frame_dim, relief=tk.FLAT, width=10, from_=1, to_=2048, textvariable=self._dim_x)
         self._spinbox_dim_x.grid(row=0, column=1)
@@ -298,42 +280,85 @@ class AxiconParamFrame(tk.Frame):
         self._period1 = tk.IntVar(self, value=30)
         self._period1.trace_add('write', callback=self.update)
 
+        self._axicon_1_is_enabled = tk.IntVar(self, value=False)
+        self._axicon_1_is_enabled.trace_add('write', callback=self.update)
+
         self._frame_period1 = tk.Frame(self)
-        self._label_period1 = tk.Label(self._frame_period1, text='Axicon 1 period')
-        self._label_period1.grid(row=0, column=0)
-        self._spinbox_period1 = tk.Spinbox(self._frame_period1, relief=tk.FLAT, width=10, from_=1, to_=2048, textvariable=self._period1)
-        self._spinbox_period1.grid(row=0, column=1)
+        self._checkbox_period1 = tk.Checkbutton(self._frame_period1, text='Enable Axicon 1', var=self._axicon_1_is_enabled, command=self.toggle_axicon_1)
+        self._checkbox_period1.grid(row=0, columnspan=2)
+        self._label_period1 = tk.Label(self._frame_period1, text='Axicon 1 period (px)')
+        self._label_period1.grid(row=1, column=0)
+        self._spinbox_period1 = tk.Spinbox(self._frame_period1, relief=tk.FLAT, width=10, from_=1, to_=2048, increment=2, textvariable=self._period1)
+        self._spinbox_period1.grid(row=1, column=1)
         self._frame_period1.grid(row=1, column=0)
 
         self._period2 = tk.IntVar(self, value=32)
         self._period2.trace_add('write', callback=self.update)
 
-        self._frame_period2 = tk.Frame(self)
         self._axicon_2_is_enabled = tk.IntVar(self, value=False)
-        self._checkbox_period2 = tk.Checkbutton(self._frame_period2, text='Enable Axicon 2', var=self._axicon_2_is_enabled)
+        self._axicon_2_is_enabled.trace_add('write', callback=self.update)
+
+        self._frame_period2 = tk.Frame(self)
+        self._checkbox_period2 = tk.Checkbutton(self._frame_period2, text='Enable Axicon 2', var=self._axicon_2_is_enabled, command=self.toggle_axicon_2)
         self._checkbox_period2.grid(row=0, columnspan=2)
-        self._label_period2 = tk.Label(self._frame_period2, text='Axicon 2 period')
+        self._label_period2 = tk.Label(self._frame_period2, text='Axicon 2 period (px)')
         self._label_period2.grid(row=1, column=0)
-        self._spinbox_period2 = tk.Spinbox(self._frame_period2, relief=tk.FLAT, width=10, from_=1, to_=2048, textvariable=self._period2)
+        self._spinbox_period2 = tk.Spinbox(self._frame_period2, relief=tk.FLAT, width=10, from_=1, to_=2048, increment=2, textvariable=self._period2)
         self._spinbox_period2.grid(row=1, column=1)
         self._frame_period2.grid(row=2, column=0)
+
+        self._lens_focal_length = tk.DoubleVar(self, value=100000)
+        self._lens_focal_length.trace_add('write', callback=self.update)
+
+        self._lens_is_enabled = tk.IntVar(self, value=False)        
+        self._lens_is_enabled.trace_add('write', callback=self.update)
+
+        self._frame_lens = tk.Frame(self)
+        self._checkbox_lens = tk.Checkbutton(self._frame_lens, text='Enable Lens', var=self._lens_is_enabled, command=self.toggle_lens)
+        self._checkbox_lens.grid(row=0, columnspan=2)
+        self._label_lens_f = tk.Label(self._frame_lens, text='Lens focal length (px)')
+        self._label_lens_f.grid(row=1, column=0)
+        self._spinbox_lens_f = tk.Spinbox(self._frame_lens, relief=tk.FLAT, width=10, from_=-9999, to_=9999, increment=10, textvariable=self._lens_focal_length)
+        self._spinbox_lens_f.grid(row=1, column=1)
+        self._frame_lens.grid(row=3, column=0)
+        
+        self._ramp_slope_x = tk.DoubleVar(self, value=0)
+        self._ramp_slope_x.trace_add('write', callback=self.update)
+
+        self._ramp_slope_y = tk.DoubleVar(self, value=0)
+        self._ramp_slope_y.trace_add('write', callback=self.update)
+
+        self._ramp_is_enabled = tk.IntVar(self, value=False)        
+        self._ramp_is_enabled.trace_add('write', callback=self.update)
+
+        self._frame_ramp = tk.Frame(self)
+        self._checkbox_ramp = tk.Checkbutton(self._frame_ramp, text='Enable Ramp', var=self._ramp_is_enabled, command=self.toggle_ramp)
+        self._checkbox_ramp.grid(row=0, column=0, columnspan=4)
+        self._spinbox_ramp_x = tk.Spinbox(self._frame_ramp, relief=tk.FLAT, width=10, from_=-1, to_=1, increment=0.01, textvariable=self._ramp_slope_x)
+        self._label_ramp1 = tk.Label(self._frame_ramp, text='Slope (px)')
+        self._label_ramp1.grid(row=1, column=0)
+        self._spinbox_ramp_x.grid(row=1, column=1)
+        self._label_ramp2 = tk.Label(self._frame_ramp, text=', ')
+        self._label_ramp2.grid(row=1, column=2)
+        self._spinbox_ramp_y = tk.Spinbox(self._frame_ramp, relief=tk.FLAT, width=10, from_=-1, to_=1, increment=0.01, textvariable=self._ramp_slope_y)
+        self._spinbox_ramp_y.grid(row=1, column=3)
+        self._frame_ramp.grid(row=4, column=0)
 
         self._offset_x = tk.IntVar(self, value=0)
         self._offset_y = tk.IntVar(self, value=0)
         self._offset_x.trace_add('write', callback=self.update)
         self._offset_y.trace_add('write', callback=self.update)
         
-
         self._frame_offset = tk.Frame(self)
-        self._label_offset = tk.Label(self._frame_offset, text='Center offset')
+        self._label_offset = tk.Label(self._frame_offset, text='Center offset (px)')
         self._label_offset.grid(row=0, column=0)
-        self._spinbox_offset_x = tk.Spinbox(self._frame_offset, relief=tk.FLAT, width=10, from_=-1024, to_=1024, textvariable=self._offset_x)
+        self._spinbox_offset_x = tk.Spinbox(self._frame_offset, relief=tk.FLAT, width=10, from_=-1024, to_=1024, increment=10, textvariable=self._offset_x)
         self._spinbox_offset_x.grid(row=0, column=1)
         self._label_offset2 = tk.Label(self._frame_offset, text=', ')
         self._label_offset2.grid(row=0, column=2)
-        self._spinbox_offset_y = tk.Spinbox(self._frame_offset, relief=tk.FLAT, width=10, from_=-1024, to_=1024, textvariable=self._offset_y)
+        self._spinbox_offset_y = tk.Spinbox(self._frame_offset, relief=tk.FLAT, width=10, from_=-1024, to_=1024, increment=10, textvariable=self._offset_y)
         self._spinbox_offset_y.grid(row=0, column=3)
-        self._frame_offset.grid(row=3, column=0)
+        self._frame_offset.grid(row=5, column=0)
 
         self._ellip_x = tk.DoubleVar(self, value=0)
         self._ellip_y = tk.DoubleVar(self, value=0)
@@ -343,23 +368,77 @@ class AxiconParamFrame(tk.Frame):
         self._frame_ellip = tk.Frame(self)
         self._label_ellip = tk.Label(self._frame_ellip, text='Ellipticity (α)')
         self._label_ellip.grid(row=0, column=0)
-        self._spinbox_ellip_x = tk.Spinbox(self._frame_ellip, relief=tk.FLAT, width=10, from_=0, to_=120, increment=0.1, textvariable=self._ellip_x)
+        self._spinbox_ellip_x = tk.Spinbox(self._frame_ellip, relief=tk.FLAT, width=10, from_=0, to_=120, increment=2, textvariable=self._ellip_x)
         self._spinbox_ellip_x.grid(row=0, column=1)
         self._label_ellip2 = tk.Label(self._frame_ellip, text=', ')
         self._label_ellip2.grid(row=0, column=2)
-        self._spinbox_ellip_y = tk.Spinbox(self._frame_ellip, relief=tk.FLAT, width=10, from_=0, to_=120, increment=0.1, textvariable=self._ellip_y)
+        self._spinbox_ellip_y = tk.Spinbox(self._frame_ellip, relief=tk.FLAT, width=10, from_=0, to_=120, increment=2, textvariable=self._ellip_y)
         self._spinbox_ellip_y.grid(row=0, column=3)
-        self._frame_ellip.grid(row=4, column=0)
+        self._frame_ellip.grid(row=6, column=0)
+    
+        self._contour_x = tk.DoubleVar(self, value=0)
+        self._contour_y = tk.DoubleVar(self, value=0)
+        self._contour_x.trace_add('write', callback=self.update)
+        self._contour_y.trace_add('write', callback=self.update)
+
+        self._frame_contour = tk.Frame(self)
+        self._label_contour = tk.Label(self._frame_contour, text='Contour (𝜀)')
+        self._label_contour.grid(row=0, column=0)
+        self._spinbox_contour_x = tk.Spinbox(self._frame_contour, relief=tk.FLAT, width=10, from_=-2, to_=2, increment=0.1, textvariable=self._contour_x)
+        self._spinbox_contour_x.grid(row=0, column=1)
+        self._label_contour2 = tk.Label(self._frame_contour, text=', ')
+        self._label_contour2.grid(row=0, column=2)
+        self._spinbox_contour_y = tk.Spinbox(self._frame_contour, relief=tk.FLAT, width=10, from_=-2, to_=2, increment=0.1, textvariable=self._contour_y)
+        self._spinbox_contour_y.grid(row=0, column=3)
+        self._frame_contour.grid(row=7, column=0)
+
+
     
     def unfix_dims(self):
-        self._spinbox_dim_x.config(state='enable', relief=tk.FLAT)
-        self._spinbox_dim_y.config(state='enable', relief=tk.FLAT)
+        self._spinbox_dim_x.config(state='normal', relief=tk.FLAT)
+        self._spinbox_dim_y.config(state='normal', relief=tk.FLAT)
     
     def fix_dims(self, dims: tuple):
         self._dim_x.set(dims[0])
         self._dim_y.set(dims[1])
         self._spinbox_dim_x.config(state='disabled', relief=tk.GROOVE)
         self._spinbox_dim_y.config(state='disabled', relief=tk.GROOVE)
+
+    def toggle_ramp(self):
+        self._spinbox_ramp_x.config(
+                state=('disabled', 'normal')[self._ramp_is_enabled.get()],
+                relief=(tk.GROOVE, tk.FLAT)[self._ramp_is_enabled.get()]
+        )
+        self._spinbox_ramp_y.config(
+                state=('disabled', 'normal')[self._ramp_is_enabled.get()],
+                relief=(tk.GROOVE, tk.FLAT)[self._ramp_is_enabled.get()]
+        )
+        self._label_ramp1.config(state=('disabled', 'normal')[self._ramp_is_enabled.get()])
+        self._label_ramp2.config(state=('disabled', 'normal')[self._ramp_is_enabled.get()])
+
+    def toggle_lens(self):
+        self._spinbox_lens_f.config(
+                state=('disabled', 'normal')[self._lens_is_enabled.get()],
+                relief=(tk.GROOVE, tk.FLAT)[self._lens_is_enabled.get()]
+         )
+        self._label_lens_f.config(state=('disabled', 'normal')[self._lens_is_enabled.get()])
+    
+    def toggle_axicon_1(self):
+        if not self._axicon_1_is_enabled.get() and self._axicon_2_is_enabled.get():
+            self._axicon_2_is_enabled.set(False)
+            self.toggle_axicon_2()
+        self._spinbox_period1.config(
+                state=('disabled', 'normal')[self._axicon_1_is_enabled.get()],
+                relief=(tk.GROOVE, tk.FLAT)[self._axicon_1_is_enabled.get()]
+         )
+        self._label_period1.config(state=('disabled', 'normal')[self._axicon_1_is_enabled.get()])
+    
+    def toggle_axicon_2(self):
+        self._spinbox_period2.config(
+                state=('disabled', 'normal')[self._axicon_2_is_enabled.get()],
+                relief=(tk.GROOVE, tk.FLAT)[self._axicon_2_is_enabled.get()]
+         )
+        self._label_period2.config(state=('disabled', 'normal')[self._axicon_2_is_enabled.get()])
     
     def update(self, var, index, mode):
         self.parent.update()
@@ -367,16 +446,23 @@ class AxiconParamFrame(tk.Frame):
     def get_parameters(self) -> dict:
         return {
             'slm-dimensions': (int(self._dim_x.get()), int(self._dim_y.get())),
+            'axicon-1-enabled': bool(self._axicon_1_is_enabled.get()),
             'period-1': int(self._period1.get()),
             'axicon-2-enabled': bool(self._axicon_2_is_enabled.get()),
             'period-2': int(self._period2.get()),
             'mask-offset': (int(self._offset_x.get()), int(self._offset_y.get())),
             'mask-ellipticity': (float(self._ellip_x.get()), float(self._ellip_y.get())),
+            'mask-contour': (float(self._contour_x.get()), float(self._contour_y.get())),
+            'ramp-enabled': bool(self._ramp_is_enabled.get()),
+            'ramp-slope': (float(self._ramp_slope_x.get()), float(self._ramp_slope_y.get())),
+            'lens-f': float(self._lens_focal_length.get()),
+            'lens-enabled': bool(self._lens_is_enabled.get())
         }
     
     def insert_params(self, params: dict):
         self._dim_x.set(params['slm-dimensions'][0])
         self._dim_y.set(params['slm-dimensions'][1])
+        self._axicon_1_is_enabled.set(params['axicon-1-enabled'])
         self._period1.set(params['period-1'])
         self._axicon_2_is_enabled.set(params['axicon-2-enabled'])
         self._period2.set(params['period-2'])
@@ -384,6 +470,17 @@ class AxiconParamFrame(tk.Frame):
         self._offset_y.set(params['mask-offset'][1])
         self._ellip_x.set(float(params['mask-ellipticity'][0]))
         self._ellip_y.set(float(params['mask-ellipticity'][1]))
+        self._contour_x.set(float(params['mask-contour'][0]))
+        self._contour_y.set(float(params['mask-contour'][1]))
+        self._lens_focal_length.set(float(params['lens-f']))
+        self._lens_is_enabled.set(params['lens-enabled'])
+        self._ramp_is_enabled.set(params['ramp-enabled'])
+        self._ramp_slope_x.set(params['ramp-slope'][0])
+        self._ramp_slope_y.set(params['ramp-slope'][1])
+        # Call update functions
+        self.toggle_axicon_2()
+        self.toggle_lens()
+        self.toggle_ramp()
 
 
 class BmpDisplay(tk.Frame):
